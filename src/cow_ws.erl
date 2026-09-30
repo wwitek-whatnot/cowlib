@@ -156,6 +156,7 @@ negotiate_permessage_deflate1(Params, Extensions, Opts) ->
 			{ok, [<<"permessage-deflate">>, RespParams], Extensions#{
 				deflate => Deflate,
 				deflate_takeover => maps:get(server_context_takeover, Negotiated),
+				deflate_window_bits => maps:get(server_max_window_bits, Negotiated),
 				inflate => Inflate,
 				inflate_takeover => maps:get(client_context_takeover, Negotiated)}}
 	end.
@@ -824,6 +825,101 @@ parse_payload_rejects_streamed_invalid_utf8_fragment_test() ->
 			{fin, text, <<0:3>>}, #{}, <<0:3>>),
 	ok.
 
+negotiate_stores_deflate_window_bits_test_() ->
+	Bits = fun(Params, Opts) ->
+		{ok, _, #{deflate_window_bits := B}}
+			= negotiate_permessage_deflate(Params, #{}, Opts),
+		B
+	end,
+	[
+		{"default", fun() -> 15 = Bits([], #{}) end},
+		{"server option", fun() -> 9 = Bits([], #{server_max_window_bits => 9}) end},
+		{"client request", fun() ->
+			10 = Bits([{<<"server_max_window_bits">>, <<"10">>}], #{})
+		end},
+		{"client window bits do not matter", fun() ->
+			15 = Bits([{<<"client_max_window_bits">>, <<"10">>}], #{})
+		end}
+	].
+
+precompressed_exts(Takeover, Bits) ->
+	{ok, _, Exts} = negotiate_permessage_deflate([], #{},
+		#{server_context_takeover => Takeover, server_max_window_bits => Bits}),
+	Exts.
+
+precompressed_frame_test_() ->
+	Raw = <<"Hello, hello, hello, hello!">>,
+	Deflated = <<1, 2, 3, 4, 5>>,
+	RawLen = byte_size(Raw),
+	Exts = precompressed_exts(no_takeover, 15),
+	Frame = fun(Type, E) ->
+		iolist_to_binary(frame({Type, {Raw, Deflated}}, E))
+	end,
+	[
+		{"text", fun() ->
+			<< 1:1, 1:1, 0:2, 1:4, 0:1, 5:7, Deflated/binary >>
+				= Frame(precompressed_text, Exts)
+		end},
+		{"binary", fun() ->
+			<< 1:1, 1:1, 0:2, 2:4, 0:1, 5:7, Deflated/binary >>
+				= Frame(precompressed_binary, Exts)
+		end},
+		{"fallback: takeover", fun() ->
+			Expected = iolist_to_binary(frame({text, Raw}, precompressed_exts(takeover, 15))),
+			Expected = Frame(precompressed_text, precompressed_exts(takeover, 15))
+		end},
+		{"fallback: smaller window", fun() ->
+			E = precompressed_exts(no_takeover, 9),
+			Expected = iolist_to_binary(frame({binary, Raw}, E)),
+			Expected = Frame(precompressed_binary, E)
+		end},
+		{"fallback: deflate disabled", fun() ->
+			<< 1:1, 0:3, 1:4, 0:1, RawLen:7, Raw/binary >>
+				= Frame(precompressed_text, #{deflate => false})
+		end},
+		{"fallback: no extensions", fun() ->
+			<< 1:1, 0:3, 2:4, 0:1, RawLen:7, Raw/binary >>
+				= Frame(precompressed_binary, #{})
+		end},
+		{"fallback: x-webkit-deflate-frame", fun() ->
+			{ok, _, E1} = negotiate_x_webkit_deflate_frame([], #{}, #{}),
+			{ok, _, E2} = negotiate_x_webkit_deflate_frame([], #{}, #{}),
+			Expected = iolist_to_binary(frame({text, Raw}, E1)),
+			Expected = Frame(precompressed_text, E2)
+		end}
+	].
+
+precompressed_frame_length_boundaries_test_() ->
+	Exts = precompressed_exts(no_takeover, 15),
+	Frame = fun(N) ->
+		iolist_to_binary(frame({precompressed_binary,
+			{<<"x">>, binary:copy(<<"a">>, N)}}, Exts))
+	end,
+	[
+		{"0", fun() -> << 1:1, 1:1, 0:2, 2:4, 0:1, 0:7 >> = Frame(0) end},
+		{"125", fun() -> << 1:1, 1:1, 0:2, 2:4, 0:1, 125:7, _:125/binary >> = Frame(125) end},
+		{"126", fun() -> << 1:1, 1:1, 0:2, 2:4, 0:1, 126:7, 126:16, _:126/binary >> = Frame(126) end},
+		{"65535", fun() -> << 1:1, 1:1, 0:2, 2:4, 0:1, 126:7, 65535:16, _:65535/binary >> = Frame(65535) end},
+		{"65536", fun() -> << 1:1, 1:1, 0:2, 2:4, 0:1, 127:7, 65536:64, _:65536/binary >> = Frame(65536) end}
+	].
+
+precompressed_frame_roundtrip_test() ->
+	Raw = binary:copy(<<"hello world ">>, 50),
+	Z = zlib:open(),
+	ok = zlib:deflateInit(Z, default, deflated, -15, 8, default),
+	Full = iolist_to_binary(zlib:deflate(Z, Raw, sync)),
+	zlib:close(Z),
+	Len = byte_size(Full) - 4,
+	<< Deflated:Len/binary, 0, 0, 255, 255 >> = Full,
+	Exts = precompressed_exts(no_takeover, 15),
+	[Header, Body] = frame({precompressed_text, {Raw, Deflated}}, Exts),
+	<< 1:1, 1:1, 0:2, 1:4, 0:1, _/bits >> = Header,
+	I = zlib:open(),
+	ok = zlib:inflateInit(I, -15),
+	Raw = iolist_to_binary(zlib:inflate(I, << Body/binary, 0, 0, 255, 255 >>)),
+	zlib:close(I),
+	ok.
+
 -endif.
 
 %% @doc Return a frame tuple from parsed state and data.
@@ -864,6 +960,23 @@ frame({pong, Payload}, _) ->
 	Len = iolist_size(Payload),
 	true = Len =< 125,
 	[<< 1:1, 0:3, 10:4, 0:1, Len:7 >>, Payload];
+%% Data frames, already compressed by the caller. The payload must be
+%% a full permessage-deflate message (tail removed) compressed with a
+%% 15 bits window and no context takeover. Otherwise use the raw payload.
+frame({precompressed_text, {_, Deflated}},
+		#{deflate := Deflate, deflate_takeover := no_takeover, deflate_window_bits := 15})
+		when Deflate =/= false ->
+	Len = payload_length(Deflated),
+	[<< 1:1, 1:1, 0:2, 1:4, 0:1, Len/bits >>, Deflated];
+frame({precompressed_text, {Raw, _}}, Extensions) ->
+	frame({text, Raw}, Extensions);
+frame({precompressed_binary, {_, Deflated}},
+		#{deflate := Deflate, deflate_takeover := no_takeover, deflate_window_bits := 15})
+		when Deflate =/= false ->
+	Len = payload_length(Deflated),
+	[<< 1:1, 1:1, 0:2, 2:4, 0:1, Len/bits >>, Deflated];
+frame({precompressed_binary, {Raw, _}}, Extensions) ->
+	frame({binary, Raw}, Extensions);
 %% Data frames, deflate-frame extension.
 frame({text, Payload}, #{deflate := Deflate, deflate_takeover := TakeOver})
 		when Deflate =/= false ->
